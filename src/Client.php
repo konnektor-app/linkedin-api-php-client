@@ -21,6 +21,7 @@ use GuzzleHttp\Client as GuzzleClient;
 use GuzzleHttp\Exception\RequestException;
 use GuzzleHttp\Psr7\Query;
 use GuzzleHttp\Psr7\Uri;
+use GuzzleHttp\Utils;
 use LinkedIn\Http\Method;
 
 /**
@@ -32,9 +33,27 @@ class Client
 {
 
     /**
-     * Grant type
+     * Float describing the number of seconds to wait while trying to connect to a server
+     * @var float
+     */
+    private $connect_timeout = 30;
+
+    /**
+     * Float describing the total timeout of the request in seconds
+     * @var float
+     */
+    private $timeout = 60;
+
+    /**
+     * Grant type for authorization code
      */
     const OAUTH2_GRANT_TYPE = 'authorization_code';
+
+    /**
+     * Gran type for refresh token
+     */
+
+    const OAUTH2_REFRESH_TOKEN = 'refresh_token';
 
     /**
      * Response type
@@ -131,6 +150,7 @@ class Client
     protected $apiHeaders = [
         'Content-Type' => 'application/json',
         'x-li-format' => 'json',
+        'X-Restli-Protocol-Version' => '2.0.0',
     ];
 
     /**
@@ -208,10 +228,12 @@ class Client
      * @param string $clientId
      * @param string $clientSecret
      */
-    public function __construct($clientId = '', $clientSecret = '')
+    public function __construct($clientId = '', $clientSecret = '', ?float $connect_timeout = null, ?float $timeout = null)
     {
         !empty($clientId) && $this->setClientId($clientId);
         !empty($clientSecret) && $this->setClientSecret($clientSecret);
+        !is_null($connect_timeout) && $this->setConnectTimeout($connect_timeout);
+        !is_null($timeout) && $this->setTimeout($timeout);
     }
 
     /**
@@ -274,12 +296,13 @@ class Client
     {
         if (!empty($code)) {
             $uri = $this->buildUrl('accessToken', []);
+            $headers = $this->getApiHeaders();
+            $headers['Content-Type'] = 'application/x-www-form-urlencoded';
+            $headers['Connection'] = 'Keep-Alive';
             $guzzle = new GuzzleClient([
-                'headers' => [
-                    'Content-Type' => 'application/json',
-                    'x-li-format' => 'json',
-                    'Connection' => 'Keep-Alive'
-                ]
+                'headers' => $headers,
+                'connect_timeout' => $this->connect_timeout,
+                'timeout' =>  $this->timeout,
             ]);
             try {
                 $response = $guzzle->post($uri, ['form_params' => [
@@ -300,18 +323,78 @@ class Client
     }
 
     /**
+     * Retrieve Access Token from Previously stored Refresh Token
+     * If Refresh Token is not provided nor setted, will return null
+
+     *
+     * @param string $refreshToken
+     *
+     * @return \LinkedIn\AccessToken|null
+     * @throws \LinkedIn\Exception
+     */
+    public function renewTokenFromRefreshToken($refreshToken = '')
+    {
+        if (!empty($refreshToken)) {
+            $uri = $this->buildUrl('accessToken', []);
+            $headers = $this->getApiHeaders();
+            $headers['Content-Type'] = 'application/x-www-form-urlencoded';
+            $headers['Connection'] = 'Keep-Alive';
+            $guzzle = new GuzzleClient([
+                'headers' => $headers,
+                'connect_timeout' =>  $this->connect_timeout,
+                'timeout' =>  $this->timeout,
+            ]);
+            try {
+                $response = $guzzle->post($uri, ['form_params' => [
+                    'grant_type' => self::OAUTH2_REFRESH_TOKEN,
+                    self::OAUTH2_REFRESH_TOKEN => $refreshToken,
+                    'client_id' => $this->getClientId(),
+                    'client_secret' => $this->getClientSecret(),
+                ]]);
+            } catch (RequestException $exception) {
+                throw Exception::fromRequestException($exception);
+            }
+            $this->setAccessToken(
+                AccessToken::fromResponse($response)
+            );
+        }
+        return $this->accessToken;
+    }
+
+    /**
      * Convert API response into Array
      *
      * @param \Psr\Http\Message\ResponseInterface $response
      *
      * @return array
+     * @throws \LinkedIn\Exception
      */
     public static function responseToArray($response)
     {
-        return \GuzzleHttp\json_decode(
-            $response->getBody()->getContents(),
-            true
-        );
+        $result = [];
+        $contents = '';
+        try {
+            if ($contents = $response->getBody()->getContents()) {
+                $result = Utils::jsonDecode(
+                    $contents,
+                    true
+                );
+            } else if ($contents = $response->getHeaders()) {
+                // Looks like when response body is empty the result might be in the headers.
+                // Good job LinkedIn.
+                $result = $contents;
+            }
+        } catch (\Exception $exception) {
+            throw new Exception(
+                'Invalid json response.',
+                'invalid-json-response',
+                $exception,
+                $exception->getMessage(),
+                $contents
+            );
+        }
+
+        return $result;
     }
 
     /**
@@ -492,6 +575,8 @@ class Client
         $guzzle = new GuzzleClient([
             'base_uri' => $this->getApiRoot(),
             'headers' => $headers,
+            'connect_timeout' =>  $this->connect_timeout,
+            'timeout' =>  $this->timeout,
         ]);
         if (!empty($params) && Method::GET === $method) {
             $endpoint .= '?' . Query::build($params);
@@ -555,11 +640,16 @@ class Client
     {
         $headers = $this->getApiHeaders();
         unset($headers['Content-Type']);
-        if (!$this->isUsingTokenParam()) {
+        //$headers = [];
+        if ($this->isUsingTokenParam()) {
+            //
+        } else {
             $headers['Authorization'] = 'Bearer ' . $this->accessToken->getToken();
         }
         $guzzle = new GuzzleClient([
-            'base_uri' => $this->getApiRoot()
+            'base_uri' => $this->getApiRoot(),
+            'connect_timeout' =>  $this->connect_timeout,
+            'timeout' =>  $this->timeout,
         ]);
         $fileinfo = pathinfo($path);
         $filename = preg_replace('/\W+/', '_', $fileinfo['filename']);
@@ -593,8 +683,32 @@ class Client
     {
         $options = [];
         if ($method === Method::POST) {
-            $options['body'] = \GuzzleHttp\json_encode($params);
+            $options['body'] = Utils::jsonEncode($params);
         }
         return $options;
+    }
+
+    /**
+     * @param mixed $connect_timeout
+     *
+     * @return self
+     */
+    public function setConnectTimeout(float $connect_timeout)
+    {
+        $this->connect_timeout = $connect_timeout;
+
+        return $this;
+    }
+
+    /**
+     * @param mixed $timeout
+     *
+     * @return self
+     */
+    public function setTimeout(float $timeout)
+    {
+        $this->timeout = $timeout;
+
+        return $this;
     }
 }
